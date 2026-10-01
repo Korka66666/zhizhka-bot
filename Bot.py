@@ -7,8 +7,8 @@ from aiogram.filters import CommandStart
 from aiogram.types import WebAppInfo, InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 
-BOT_TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"
-ADMIN_CHAT_ID = ВАШ_ЧИСЛОВОЙ_ID
+BOT_TOKEN = "8737856125:AAFDS38fdormQawDeeI0-f87J1jfjK4zLig"
+ADMIN_CHAT_ID = 1299750536
 WEBAPP_URL = "https://regal-parfait-e29c47.netlify.app"
 
 bot = Bot(token=BOT_TOKEN)
