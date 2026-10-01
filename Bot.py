@@ -30,7 +30,7 @@ async def start_cmd(message: types.Message):
         parse_mode="HTML"
     )
 
-# Прием заказа с витрины и автоматическое списание в таблице
+# Прием POST-запроса от WebApp сайта
 async def handle_order_post(request):
     try:
         data = await request.json()
@@ -47,7 +47,7 @@ async def handle_order_post(request):
             items_for_gas.append({"variant": variant, "qty": count})
             order_lines.append(f"• <b>{html.escape(title)}</b> [Вкус: {html.escape(variant)}] — {count} шт. по {price}")
 
-        # Стучимся в Google Таблицу на списание остатков
+        # 1. Отправляем в Google Таблицу на проверку и списание
         gas_payload = {"action": "deduct", "items": items_for_gas}
         async with aiohttp.ClientSession() as session:
             async with session.post(GAS_URL, json=gas_payload, allow_redirects=True) as resp:
@@ -56,38 +56,39 @@ async def handle_order_post(request):
                     gas_res = json.loads(resp_text)
                     if gas_res.get("status") == "error":
                         return web.Response(
-                            status=400, 
-                            text=json.dumps({"message": gas_res.get("message")}), 
+                            status=400,
+                            text=json.dumps({"message": gas_res.get("message")}),
                             content_type="application/json",
                             headers={"Access-Control-Allow-Origin": "*"}
                         )
                 except Exception:
                     pass
 
+        # 2. Формируем чек для отправки админу
         items_text = "\n".join(order_lines) if order_lines else "Пустой заказ"
-        raw_user = user_info.get('username')
-        username = f"@{raw_user}" if raw_user else "Не указан"
-        client_name = html.escape(user_info.get('name') or "Покупатель")
-        client_id = user_info.get('id') or "Неизвестен"
+        raw_username = user_info.get("username")
+        username_str = f"@{raw_username}" if raw_username else "Не указан"
+        client_name = html.escape(user_info.get("name") or "Покупатель")
+        client_id = user_info.get("id") or "Неизвестен"
 
         admin_msg = (
             f"🚨 <b>НОВЫЙ ЗАКАЗ В ШОПЕ «ЖИЖКА»!</b>\n\n"
-            f"👤 <b>Покупатель:</b> {client_name} ({html.escape(username)})\n"
+            f"👤 <b>Покупатель:</b> {client_name} ({html.escape(username_str)})\n"
             f"🆔 ID: <code>{client_id}</code>\n\n"
             f"📦 <b>Состав заказа:</b>\n{items_text}\n\n"
             f"💵 <b>Итого к оплате:</b> {total} ₽"
         )
-        
-        # Кнопки для админа: вернуть товар прямо из Telegram
+
+        # 3. Инлайн-кнопки CRM для возврата товара
         markup = InlineKeyboardMarkup(inline_keyboard=[])
         for idx, item in enumerate(items_for_gas):
             markup.inline_keyboard.append([
                 InlineKeyboardButton(text=f"🔙 Вернуть на склад: {item['variant']}", callback_data=f"ret_{idx}")
             ])
         markup.inline_keyboard.append([
-            InlineKeyboardButton(text="❌ Отменить весь заказ", callback_data="ret_all")
+            InlineKeyboardButton(text="❌ Отменить заказ полностью", callback_data="ret_all")
         ])
-        
+
         await bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_msg, reply_markup=markup, parse_mode="HTML")
         return web.Response(
             text=json.dumps({"status": "ok"}),
@@ -98,18 +99,18 @@ async def handle_order_post(request):
         print(f"Ошибка заказа: {e}")
         return web.Response(status=500, text=str(e), headers={"Access-Control-Allow-Origin": "*"})
 
-# Обработка нажатий кнопок возврата товара
+# Обработка нажатий на кнопки отмены/возврата (строго для админа)
 @dp.callback_query(F.data.startswith("ret_"))
 async def handle_return(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID:
         return await call.answer("❌ Только администратор может отменять заказы!", show_alert=True)
-        
+
     lines = call.message.text.split("\n")
     bullet_indices = [i for i, line in enumerate(lines) if line.startswith("• ")]
-    
+
     items_to_return = []
     lines_to_modify = []
-    
+
     action = call.data.split("_")[1]
     if action == "all":
         lines_to_modify = bullet_indices
@@ -117,7 +118,7 @@ async def handle_return(call: types.CallbackQuery):
         target_idx = int(action)
         if target_idx < len(bullet_indices):
             lines_to_modify = [bullet_indices[target_idx]]
-        
+
     for line_idx in lines_to_modify:
         line_text = lines[line_idx]
         match = re.search(r"\[Вкус:\s*(.*?)\]\s*—\s*(\d+)\s*шт", line_text)
@@ -125,13 +126,13 @@ async def handle_return(call: types.CallbackQuery):
             items_to_return.append({"variant": match.group(1).strip(), "qty": int(match.group(2))})
             lines[line_idx] = line_text.replace("• ", "❌ <s>").replace("шт.", "шт.</s> (Отменено)")
 
-    # Отправляем команду в Google Таблицу на возврат
+    # Отправляем в Google Таблицу на возврат товара
     if items_to_return:
         gas_payload = {"action": "add", "items": items_to_return}
         async with aiohttp.ClientSession() as session:
             await session.post(GAS_URL, json=gas_payload)
 
-    # Убираем нажатую кнопку
+    # Удаляем нажатые кнопки
     new_kb = []
     for row in call.message.reply_markup.inline_keyboard:
         for btn in row:
@@ -140,7 +141,7 @@ async def handle_return(call: types.CallbackQuery):
             new_kb.append([btn])
 
     await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=new_kb), parse_mode="HTML")
-    await call.answer("✅ Товар возвращен в таблицу!")
+    await call.answer("✅ Товар успешно возвращен в таблицу!")
 
 async def handle_options(request):
     return web.Response(headers={
