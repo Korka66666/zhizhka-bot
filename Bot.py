@@ -1,8 +1,11 @@
 import os
 import json
 import asyncio
+import re
+import html
+import aiohttp
 from collections import Counter
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import WebAppInfo, InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
@@ -10,6 +13,7 @@ from aiohttp import web
 BOT_TOKEN = "8737856125:AAFDS38fdormQawDeeI0-f87J1jfjK4zLig"
 ADMIN_CHAT_ID = 8651846848
 WEBAPP_URL = "https://regal-parfait-e29c47.netlify.app"
+GAS_URL = "https://script.google.com/macros/s/AKfycbyDk-sDPisni6TJ4R14SEzh5W765oSpj0-3PuqE0PeLGkbMkSW3XahP82Q64XuFHKgGTQ/exec"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -20,13 +24,13 @@ async def start_cmd(message: types.Message):
         [InlineKeyboardButton(text="⚡ Открыть витрину ЖИЖКА", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
     await message.answer(
-        "👋 **Добро пожаловать в шоп ЖИЖКА!**\n\n"
-        "Жми кнопку ниже, чтобы открыть каталог и собрать заказ.",
+        "👋 <b>Добро пожаловать в шоп ЖИЖКА!</b>\n\n"
+        "Нажмите кнопку ниже, чтобы открыть каталог и собрать заказ.",
         reply_markup=kb,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
-# Приём заказа с витрины напрямую через POST
+# Прием заказа с витрины и автоматическое списание в таблице
 async def handle_order_post(request):
     try:
         data = await request.json()
@@ -36,26 +40,55 @@ async def handle_order_post(request):
 
         counts = Counter(f"{it['title']} | {it['variant']} | {it['price']} ₽" for it in items)
         
+        items_for_gas = []
         order_lines = []
         for line, count in counts.items():
             title, variant, price = line.split(" | ")
-            order_lines.append(f"• **{title}** ({variant}) — {count} шт. по {price}")
+            items_for_gas.append({"variant": variant, "qty": count})
+            order_lines.append(f"• <b>{html.escape(title)}</b> [Вкус: {html.escape(variant)}] — {count} шт. по {price}")
+
+        # Стучимся в Google Таблицу на списание остатков
+        gas_payload = {"action": "deduct", "items": items_for_gas}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(GAS_URL, json=gas_payload, allow_redirects=True) as resp:
+                resp_text = await resp.text()
+                try:
+                    gas_res = json.loads(resp_text)
+                    if gas_res.get("status") == "error":
+                        return web.Response(
+                            status=400, 
+                            text=json.dumps({"message": gas_res.get("message")}), 
+                            content_type="application/json",
+                            headers={"Access-Control-Allow-Origin": "*"}
+                        )
+                except Exception:
+                    pass
 
         items_text = "\n".join(order_lines) if order_lines else "Пустой заказ"
-        
-        username = f"@{user_info.get('username')}" if user_info.get('username') else "Не указан"
-        client_name = user_info.get('name') or "Покупатель с сайта"
+        raw_user = user_info.get('username')
+        username = f"@{raw_user}" if raw_user else "Не указан"
+        client_name = html.escape(user_info.get('name') or "Покупатель")
         client_id = user_info.get('id') or "Неизвестен"
 
         admin_msg = (
-            f"🚨 **НОВЫЙ ЗАКАЗ В ШОПЕ «ЖИЖКА»!**\n\n"
-            f"👤 **Покупатель:** {client_name} ({username})\n"
-            f"🆔 ID: `{client_id}`\n\n"
-            f"📦 **Состав заказа:**\n{items_text}\n\n"
-            f"💵 **Итого к оплате:** {total} ₽"
+            f"🚨 <b>НОВЫЙ ЗАКАЗ В ШОПЕ «ЖИЖКА»!</b>\n\n"
+            f"👤 <b>Покупатель:</b> {client_name} ({html.escape(username)})\n"
+            f"🆔 ID: <code>{client_id}</code>\n\n"
+            f"📦 <b>Состав заказа:</b>\n{items_text}\n\n"
+            f"💵 <b>Итого к оплате:</b> {total} ₽"
         )
         
-        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_msg, parse_mode="Markdown")
+        # Кнопки для админа: вернуть товар прямо из Telegram
+        markup = InlineKeyboardMarkup(inline_keyboard=[])
+        for idx, item in enumerate(items_for_gas):
+            markup.inline_keyboard.append([
+                InlineKeyboardButton(text=f"🔙 Вернуть на склад: {item['variant']}", callback_data=f"ret_{idx}")
+            ])
+        markup.inline_keyboard.append([
+            InlineKeyboardButton(text="❌ Отменить весь заказ", callback_data="ret_all")
+        ])
+        
+        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_msg, reply_markup=markup, parse_mode="HTML")
         return web.Response(
             text=json.dumps({"status": "ok"}),
             content_type="application/json",
@@ -64,6 +97,50 @@ async def handle_order_post(request):
     except Exception as e:
         print(f"Ошибка заказа: {e}")
         return web.Response(status=500, text=str(e), headers={"Access-Control-Allow-Origin": "*"})
+
+# Обработка нажатий кнопок возврата товара
+@dp.callback_query(F.data.startswith("ret_"))
+async def handle_return(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_CHAT_ID:
+        return await call.answer("❌ Только администратор может отменять заказы!", show_alert=True)
+        
+    lines = call.message.text.split("\n")
+    bullet_indices = [i for i, line in enumerate(lines) if line.startswith("• ")]
+    
+    items_to_return = []
+    lines_to_modify = []
+    
+    action = call.data.split("_")[1]
+    if action == "all":
+        lines_to_modify = bullet_indices
+    else:
+        target_idx = int(action)
+        if target_idx < len(bullet_indices):
+            lines_to_modify = [bullet_indices[target_idx]]
+        
+    for line_idx in lines_to_modify:
+        line_text = lines[line_idx]
+        match = re.search(r"\[Вкус:\s*(.*?)\]\s*—\s*(\d+)\s*шт", line_text)
+        if match:
+            items_to_return.append({"variant": match.group(1).strip(), "qty": int(match.group(2))})
+            lines[line_idx] = line_text.replace("• ", "❌ <s>").replace("шт.", "шт.</s> (Отменено)")
+
+    # Отправляем команду в Google Таблицу на возврат
+    if items_to_return:
+        gas_payload = {"action": "add", "items": items_to_return}
+        async with aiohttp.ClientSession() as session:
+            await session.post(GAS_URL, json=gas_payload)
+
+    # Убираем нажатую кнопку
+    new_kb = []
+    for row in call.message.reply_markup.inline_keyboard:
+        for btn in row:
+            if btn.callback_data == call.data or call.data == "ret_all":
+                continue
+            new_kb.append([btn])
+
+    await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=new_kb), parse_mode="HTML")
+    await call.answer("✅ Товар возвращен в таблицу!")
 
 async def handle_options(request):
     return web.Response(headers={
@@ -80,7 +157,6 @@ async def start_web_server():
     app.router.add_get("/", handle_ping)
     app.router.add_post("/order", handle_order_post)
     app.router.add_options("/order", handle_options)
-    
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
@@ -88,7 +164,7 @@ async def start_web_server():
     await site.start()
 
 async def main():
-    print("Бот шопа ЖИЖКА запущен с новым токеном...")
+    print("Бот шопа ЖИЖКА запущен...")
     await start_web_server()
     await dp.start_polling(bot)
 
