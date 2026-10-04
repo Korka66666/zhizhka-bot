@@ -35,7 +35,7 @@ def save_orders(data):
         with open(ORDERS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"Ошибка сохранения заказов: {e}")
+        print(f"⚠ Ошибка сохранения заказов: {e}")
 
 orders_db = load_orders()
 
@@ -112,7 +112,7 @@ async def handle_order_post(request):
             items_for_gas.append({"variant": variant, "qty": count})
             order_lines.append(f"• <b>{html.escape(title)}</b> [{tlabel}: {html.escape(variant)}] — {count} шт. по {price} ₽")
 
-        # 1. Списание в таблице
+        # Списание в таблице Google
         async with aiohttp.ClientSession() as session:
             async with session.post(GAS_URL, json={"action": "deduct", "items": items_for_gas}, allow_redirects=True) as resp:
                 resp_text = await resp.text()
@@ -146,7 +146,7 @@ async def handle_order_post(request):
         admin_markup = build_admin_keyboard_from_lines(admin_msg.split("\n"))
         sent_admin_msg = await bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_msg, reply_markup=admin_markup, parse_mode="HTML")
 
-        # Сохранение в базу заказов
+        # Сохранение в базу заказов с использованием безопасного insert(0)
         order_entry = {
             "id": int(datetime.datetime.now().timestamp() * 1000),
             "admin_message_id": sent_admin_msg.message_id,
@@ -160,7 +160,7 @@ async def handle_order_post(request):
         str_cid = str(client_id)
         if str_cid not in orders_db:
             orders_db[str_cid] = []
-        orders_db[str_cid].unshift if hasattr(orders_db[str_cid], 'unshift') else orders_db[str_cid].insert(0, order_entry)
+        orders_db[str_cid].insert(0, order_entry)
         save_orders(orders_db)
 
         # Чек покупателю
@@ -184,6 +184,7 @@ async def handle_order_post(request):
             headers={"Access-Control-Allow-Origin": "*"}
         )
     except Exception as e:
+        print(f"❌ Ошибка в handle_order_post: {e}")
         return web.Response(
             status=500,
             text=json.dumps({"status": "error", "message": str(e)}),
@@ -264,6 +265,7 @@ async def handle_order_edit(request):
 
         return web.Response(text=json.dumps({"status": "ok"}), content_type="application/json", headers={"Access-Control-Allow-Origin": "*"})
     except Exception as e:
+        print(f"❌ Ошибка в handle_order_edit: {e}")
         return web.Response(status=500, text=json.dumps({"status": "error", "message": str(e)}), content_type="application/json", headers={"Access-Control-Allow-Origin": "*"})
 
 # Подтверждение выдачи
