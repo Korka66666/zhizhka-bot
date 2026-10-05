@@ -26,7 +26,8 @@ def load_orders():
         try:
             with open(ORDERS_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
+        except Exception as e:
+            print(f"⚠ Ошибка чтения {ORDERS_FILE}: {e}")
             return {}
     return {}
 
@@ -35,12 +36,12 @@ def save_orders(data):
         with open(ORDERS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"⚠ Ошибка сохранения заказов: {e}")
+        print(f"⚠ Ошибка сохранения {ORDERS_FILE}: {e}")
 
 orders_db = load_orders()
 
 def build_admin_keyboard_from_lines(lines):
-    bullet_indices = [i for i, l in enumerate(lines) if l.startswith("• ")]
+    bullet_indices = [i for i, l in enumerate(lines) if l.strip().startswith("•")]
     if not bullet_indices:
         return None
 
@@ -49,12 +50,14 @@ def build_admin_keyboard_from_lines(lines):
         line_text = lines[line_idx]
         m = re.search(r"\[(?:Вкус|Цвет):\s*(.*?)\]\s*—\s*(\d+)\s*шт", line_text)
         if m:
-            var_name, qty = m.group(1), int(m.group(2))
+            var_name = html.unescape(m.group(1).strip())
+            qty = int(m.group(2))
             btn_title = f"🔙 Вернуть 1 шт: {var_name} ({qty} шт)" if qty > 1 else f"🔙 Вернуть на склад: {var_name}"
             kb.append([InlineKeyboardButton(text=btn_title, callback_data=f"ret1_{btn_idx}")])
     kb.append([InlineKeyboardButton(text="❌ Отменить заказ полностью", callback_data="ret_all")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
+# Команда /start
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
     user_id = message.from_user.id
@@ -78,17 +81,47 @@ async def start_cmd(message: types.Message):
             parse_mode="HTML"
         )
 
-# Отдача активных заказов сайту
+# Автоответчик на текстовые сообщения
+@dp.message()
+async def any_text_handler(message: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ Открыть витрину ЖИЖКА", web_app=WebAppInfo(url=WEBAPP_URL))]
+    ])
+    await message.answer("Жми кнопку ниже, чтобы перейти в витрину шопа ЖИЖКА 👇", reply_markup=kb)
+
+# --- AIOHTTP WEB-ОБРАБОТЧИКИ (СИНХРОНИЗАЦИЯ С САЙТОМ) ---
+
+# Отдача заказов сайту
 async def handle_get_orders(request):
     user_id = request.query.get("user_id", "")
     user_orders = orders_db.get(str(user_id), [])
     return web.Response(
         text=json.dumps(user_orders),
-        content_type="application/json",
-        headers={"Access-Control-Allow-Origin": "*"}
+        content_type="application/json"
     )
 
-# Прием нового заказа
+# Удаление заказа клиентом через витрину
+async def handle_order_delete(request):
+    try:
+        data = await request.json()
+        order_id = str(data.get("order_id", ""))
+        user_id = str(data.get("user_id", ""))
+        
+        found = False
+        for uid, user_orders in orders_db.items():
+            if not user_id or uid == user_id:
+                for idx, o in enumerate(user_orders):
+                    if str(o.get("id")) == order_id or str(o.get("admin_message_id")) == order_id:
+                        user_orders.pop(idx)
+                        found = True
+                        break
+        if found:
+            save_orders(orders_db)
+        return web.Response(text=json.dumps({"status": "ok"}), content_type="application/json")
+    except Exception as e:
+        return web.Response(status=500, text=json.dumps({"status": "error", "message": str(e)}), content_type="application/json")
+
+# Прием нового заказа с сайта
 async def handle_order_post(request):
     try:
         data = await request.json()
@@ -103,16 +136,26 @@ async def handle_order_post(request):
         username_str = f"@{raw_username}" if raw_username else "Не указан"
         client_name = html.escape(user_info.get("name") or "Покупатель")
 
-        counts = Counter(f"{it['title']} | {it['variant']} | {it['price']} | {it.get('typeLabel', 'Вкус')}" for it in items)
-        
+        # Группировка одинаковых товаров с защитой от undefined
+        counts = Counter()
+        for it in items:
+            t = it.get("title", "Товар")
+            v = it.get("variant") or it.get("cleanName") or "Стандарт"
+            p = int(it.get("price") or 0)
+            tl = it.get("typeLabel") or "Вкус"
+            counts[(t, v, p, tl)] += 1
+
         items_for_gas = []
         order_lines = []
-        for line, count in counts.items():
-            title, variant, price, tlabel = line.split(" | ")
-            items_for_gas.append({"variant": variant, "qty": count})
-            order_lines.append(f"• <b>{html.escape(title)}</b> [{tlabel}: {html.escape(variant)}] — {count} шт. по {price} ₽")
+        clean_items_list = []
 
-        # Списание в таблице Google
+        for (t, v, p, tl), count in counts.items():
+            items_for_gas.append({"variant": v, "qty": count})
+            order_lines.append(f"• <b>{html.escape(t)}</b> [{tl}: {html.escape(v)}] — {count} шт. по {p} ₽")
+            for _ in range(count):
+                clean_items_list.append({"title": t, "variant": v, "price": p, "typeLabel": tl})
+
+        # Списание остатков в Google Таблице
         async with aiohttp.ClientSession() as session:
             async with session.post(GAS_URL, json={"action": "deduct", "items": items_for_gas}, allow_redirects=True) as resp:
                 resp_text = await resp.text()
@@ -121,9 +164,8 @@ async def handle_order_post(request):
                     if gas_res.get("status") == "error":
                         return web.Response(
                             status=400,
-                            text=json.dumps({"status": "error", "message": gas_res.get("message")}),
-                            content_type="application/json",
-                            headers={"Access-Control-Allow-Origin": "*"}
+                            text=json.dumps({"status": "error", "message": gas_res.get("message", "Товар закончился")}),
+                            content_type="application/json"
                         )
                 except Exception:
                     pass
@@ -144,14 +186,18 @@ async def handle_order_post(request):
         )
 
         admin_markup = build_admin_keyboard_from_lines(admin_msg.split("\n"))
-        sent_admin_msg = await bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_msg, reply_markup=admin_markup, parse_mode="HTML")
+        sent_admin_msg = await bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=admin_msg,
+            reply_markup=admin_markup,
+            parse_mode="HTML"
+        )
 
-        # Сохранение в базу заказов с использованием безопасного insert(0)
         order_entry = {
             "id": int(datetime.datetime.now().timestamp() * 1000),
             "admin_message_id": sent_admin_msg.message_id,
             "date": datetime.datetime.now().strftime("%H:%M"),
-            "items": items,
+            "items": clean_items_list,
             "total": total,
             "delivery_type": delivery_type,
             "delivery_address": delivery_addr,
@@ -163,7 +209,7 @@ async def handle_order_post(request):
         orders_db[str_cid].insert(0, order_entry)
         save_orders(orders_db)
 
-        # Чек покупателю
+        # Чек клиенту в Telegram
         if client_id and client_id != ADMIN_CHAT_ID:
             try:
                 buyer_delivery = "🚗 Доставка: 150–400 ₽ (администратор согласует точную сумму)" if delivery_type == "delivery" else "🏬 Самовывоз"
@@ -178,21 +224,21 @@ async def handle_order_post(request):
             except Exception:
                 pass
 
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Новый заказ от {client_name} на сумму {total} ₽")
+
         return web.Response(
             text=json.dumps({"status": "ok", "admin_message_id": sent_admin_msg.message_id}),
-            content_type="application/json",
-            headers={"Access-Control-Allow-Origin": "*"}
+            content_type="application/json"
         )
     except Exception as e:
         print(f"❌ Ошибка в handle_order_post: {e}")
         return web.Response(
             status=500,
             text=json.dumps({"status": "error", "message": str(e)}),
-            content_type="application/json",
-            headers={"Access-Control-Allow-Origin": "*"}
+            content_type="application/json"
         )
 
-# Редактирование заказа покупателем с витрины
+# Изменение заказа покупателем
 async def handle_order_edit(request):
     try:
         data = await request.json()
@@ -208,13 +254,14 @@ async def handle_order_edit(request):
         username_str = f"@{user_info.get('username')}" if user_info.get("username") else "Не указан"
         client_name = html.escape(user_info.get("name") or "Покупатель")
 
-        # Корректировка остатков в Google Таблице
-        old_counts = Counter(it["variant"] for it in old_items)
-        new_counts = Counter(it["variant"] for it in new_items)
+        old_counts = Counter((it.get("variant") or it.get("cleanName")) for it in old_items)
+        new_counts = Counter((it.get("variant") or it.get("cleanName")) for it in new_items)
 
         to_add = []
         to_deduct = []
         for v in set(old_counts.keys()).union(set(new_counts.keys())):
+            if not v:
+                continue
             diff = new_counts[v] - old_counts[v]
             if diff > 0:
                 to_deduct.append({"variant": v, "qty": diff})
@@ -227,11 +274,20 @@ async def handle_order_edit(request):
             if to_deduct:
                 await session.post(GAS_URL, json={"action": "deduct", "items": to_deduct}, allow_redirects=True)
 
-        counts = Counter(f"{it['title']} | {it['variant']} | {it['price']} | {it.get('typeLabel', 'Вкус')}" for it in new_items)
+        counts = Counter()
+        for it in new_items:
+            t = it.get("title", "Товар")
+            v = it.get("variant") or it.get("cleanName") or "Стандарт"
+            p = int(it.get("price") or 0)
+            tl = it.get("typeLabel") or "Вкус"
+            counts[(t, v, p, tl)] += 1
+
         order_lines = []
-        for line, count in counts.items():
-            title, variant, price, tlabel = line.split(" | ")
-            order_lines.append(f"• <b>{html.escape(title)}</b> [{tlabel}: {html.escape(variant)}] — {count} шт. по {price} ₽")
+        clean_new_items = []
+        for (t, v, p, tl), count in counts.items():
+            order_lines.append(f"• <b>{html.escape(t)}</b> [{tl}: {html.escape(v)}] — {count} шт. по {p} ₽")
+            for _ in range(count):
+                clean_new_items.append({"title": t, "variant": v, "price": p, "typeLabel": tl})
 
         items_text = "\n".join(order_lines)
         if delivery_type == "delivery":
@@ -250,62 +306,92 @@ async def handle_order_edit(request):
 
         admin_markup = build_admin_keyboard_from_lines(updated_msg.split("\n"))
         if admin_message_id:
-            await bot.edit_message_text(chat_id=ADMIN_CHAT_ID, message_id=admin_message_id, text=updated_msg, reply_markup=admin_markup, parse_mode="HTML")
+            try:
+                await bot.edit_message_text(
+                    chat_id=ADMIN_CHAT_ID,
+                    message_id=admin_message_id,
+                    text=updated_msg,
+                    reply_markup=admin_markup,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                print(f"⚠ Ошибка обновления сообщения админа: {e}")
 
         # Обновление в базе
         str_cid = str(client_id)
         if str_cid in orders_db:
             for o in orders_db[str_cid]:
                 if o.get("admin_message_id") == admin_message_id:
-                    o["items"] = new_items
+                    o["items"] = clean_new_items
                     o["total"] = total
                     o["delivery_type"] = delivery_type
                     o["delivery_address"] = delivery_addr
             save_orders(orders_db)
 
-        return web.Response(text=json.dumps({"status": "ok"}), content_type="application/json", headers={"Access-Control-Allow-Origin": "*"})
+        return web.Response(text=json.dumps({"status": "ok"}), content_type="application/json")
     except Exception as e:
         print(f"❌ Ошибка в handle_order_edit: {e}")
-        return web.Response(status=500, text=json.dumps({"status": "error", "message": str(e)}), content_type="application/json", headers={"Access-Control-Allow-Origin": "*"})
+        return web.Response(status=500, text=json.dumps({"status": "error", "message": str(e)}), content_type="application/json")
 
-# Подтверждение выдачи
+# --- КНОПКИ АДМИНИСТРАТОРА В TELEGRAM ---
+
+# Подтверждение выполнения заказа
 @dp.callback_query(F.data == "order_done")
 async def handle_order_done(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID:
         return await call.answer("❌ Только администратор!", show_alert=True)
     
-    # Помечаем в базе как завершенный
-    for user_orders in orders_db.values():
+    buyer_id = None
+    for uid, user_orders in orders_db.items():
         for o in user_orders:
             if o.get("admin_message_id") == call.message.message_id:
                 o["status"] = "completed"
+                buyer_id = uid
     save_orders(orders_db)
 
-    new_text = call.message.text + "\n\n🎉 <b>ЗАКАЗ УСПЕШНО ВЫПОЛНЕН И ВЫДАН!</b>"
+    orig_html = call.message.html_text or call.message.text
+    new_text = orig_html + "\n\n🎉 <b>ЗАКАЗ УСПЕШНО ВЫПОЛНЕН И ВЫДАН!</b>"
     await call.message.edit_text(new_text, reply_markup=None, parse_mode="HTML")
     await call.answer("✅ Заказ подтвержден и закрыт!")
 
-# Поштучный возврат
+    # Оповещение покупателю
+    if buyer_id and buyer_id != str(ADMIN_CHAT_ID):
+        try:
+            await bot.send_message(
+                chat_id=int(buyer_id),
+                text="🎉 <b>Ваш заказ успешно выдан!</b>\nСпасибо за покупку в шопе ЖИЖКА! Ждем вас снова.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+# Поштучный возврат позиции на склад
 @dp.callback_query(F.data.startswith("ret1_"))
 async def handle_return_one(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID:
         return await call.answer("❌ Только администратор!", show_alert=True)
 
     target_btn_idx = int(call.data.split("_")[1])
-    lines = call.message.text.split("\n")
-    bullet_indices = [i for i, l in enumerate(lines) if l.startswith("• ")]
+    raw_text = call.message.html_text or call.message.text
+    lines = raw_text.split("\n")
+    bullet_indices = [i for i, l in enumerate(lines) if l.strip().startswith("•")]
 
     if target_btn_idx >= len(bullet_indices):
-        return await call.answer("Позиция уже возвращена!")
+        return await call.answer("Позиция уже возвращена!", show_alert=True)
 
     line_idx = bullet_indices[target_btn_idx]
     line_text = lines[line_idx]
 
-    m = re.search(r"•\s*(.*?)\s*\[(Вкус|Цвет):\s*(.*?)\]\s*—\s*(\d+)\s*шт\.\s*по\s*(\d+)", line_text)
+    pattern = r"•\s*(?:<b>)?(.*?)(?:</b>)?\s*\[(Вкус|Цвет):\s*(.*?)\]\s*—\s*(\d+)\s*шт\.\s*по\s*(\d+)"
+    m = re.search(pattern, line_text)
     if not m:
-        return await call.answer("Ошибка парсинга строки")
+        return await call.answer("Ошибка парсинга строки", show_alert=True)
 
-    title, tlabel, variant, qty, price = m.group(1), m.group(2), m.group(3), int(m.group(4)), int(m.group(5))
+    title = html.unescape(m.group(1).strip())
+    tlabel = m.group(2).strip()
+    variant = html.unescape(m.group(3).strip())
+    qty = int(m.group(4))
+    price = int(m.group(5))
 
     # Возврат 1 шт в Google Таблицу
     async with aiohttp.ClientSession() as session:
@@ -313,16 +399,17 @@ async def handle_return_one(call: types.CallbackQuery):
 
     new_qty = qty - 1
     if new_qty > 0:
-        lines[line_idx] = f"• {title} [{tlabel}: {variant}] — {new_qty} шт. по {price} ₽"
+        lines[line_idx] = f"• <b>{html.escape(title)}</b> [{tlabel}: {html.escape(variant)}] — {new_qty} шт. по {price} ₽"
     else:
-        lines[line_idx] = f"❌ <s>{title} [{tlabel}: {variant}] — 1 шт.</s> (Возвращено)"
+        lines[line_idx] = f"❌ <s><b>{html.escape(title)}</b> [{tlabel}: {html.escape(variant)}] — 1 шт.</s> (Возвращено)"
 
-    # Пересчет суммы
-    total_match = re.search(r"(?:Итого к оплате|Итого за товары|Новый итог к оплате|Новый итог|Итого):\s*(\d+)", call.message.text)
+    # Пересчет суммы с сохранением тегов
+    total_pattern = r"((?:<b>)?(?:Итого к оплате|Итого за товары|Новый итог к оплате|Новый итог|Итого):?(?:</b>)?:?\s*)(\d+)"
+    total_match = re.search(total_pattern, raw_text)
     if total_match:
-        old_total = int(total_match.group(1))
+        old_total = int(total_match.group(2))
         new_total = max(0, old_total - price)
-        lines = [re.sub(r"((?:Итого к оплате|Итого за товары|Новый итог к оплате|Новый итог|Итого):\s*)\d+", rf"\g<1>{new_total}", l) for l in lines]
+        lines = [re.sub(total_pattern, rf"\g<1>{new_total}", l) for l in lines]
 
     # Корректировка в базе
     for user_orders in orders_db.values():
@@ -330,77 +417,108 @@ async def handle_return_one(call: types.CallbackQuery):
             if o.get("admin_message_id") == call.message.message_id:
                 o["total"] = max(0, o.get("total", 0) - price)
                 for item in o.get("items", []):
-                    if item.get("variant") == variant:
+                    item_var = item.get("variant") or item.get("cleanName")
+                    if item_var == variant:
                         o["items"].remove(item)
                         break
+                if not o.get("items") or o["total"] == 0:
+                    o["status"] = "canceled"
     save_orders(orders_db)
 
     new_kb = build_admin_keyboard_from_lines(lines)
     await call.message.edit_text("\n".join(lines), reply_markup=new_kb, parse_mode="HTML")
     await call.answer(f"✅ 1 шт. ({variant}) возвращена на склад!")
 
-# Полная отмена
+# Полная отмена заказа
 @dp.callback_query(F.data == "ret_all")
 async def handle_return_all(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID:
         return await call.answer("❌ Только администратор!", show_alert=True)
 
-    lines = call.message.text.split("\n")
+    raw_text = call.message.html_text or call.message.text
+    lines = raw_text.split("\n")
     items_to_return = []
-    for idx, line in enumerate(lines):
-        if line.startswith("• "):
-            m = re.search(r"\[(?:Вкус|Цвет):\s*(.*?)\]\s*—\s*(\d+)\s*шт", line)
-            if m:
-                items_to_return.append({"variant": m.group(1).strip(), "qty": int(m.group(2))})
-                lines[idx] = line.replace("• ", "❌ <s>").replace("шт.", "шт.</s> (Отменено)")
 
+    pattern = r"•\s*(?:<b>)?(.*?)(?:</b>)?\s*\[(?:Вкус|Цвет):\s*(.*?)\]\s*—\s*(\d+)\s*шт"
+    for idx, line in enumerate(lines):
+        if line.strip().startswith("•"):
+            m = re.search(pattern, line)
+            if m:
+                var_name = html.unescape(m.group(2).strip())
+                items_to_return.append({"variant": var_name, "qty": int(m.group(3))})
+                lines[idx] = re.sub(r"^•\s*", "❌ <s>", line) + "</s> (Отменено)"
+
+    # Возврат всех позиций в Google Таблицу
     if items_to_return:
         async with aiohttp.ClientSession() as session:
             await session.post(GAS_URL, json={"action": "add", "items": items_to_return}, allow_redirects=True)
 
-    lines = [re.sub(r"((?:Итого к оплате|Итого за товары|Новый итог к оплате|Новый итог|Итого):\s*)\d+", r"\g<1>0", l) for l in lines]
+    total_pattern = r"((?:<b>)?(?:Итого к оплате|Итого за товары|Новый итог к оплате|Новый итог|Итого):?(?:</b>)?:?\s*)\d+"
+    lines = [re.sub(total_pattern, r"\g<1>0", l) for l in lines]
     lines.append("\n❌ <b>ЗАКАЗ ПОЛНОСТЬЮ АННУЛИРОВАН</b>")
 
-    # Помечаем в базе как отмененный
-    for user_orders in orders_db.values():
+    buyer_id = None
+    for uid, user_orders in orders_db.items():
         for o in user_orders:
             if o.get("admin_message_id") == call.message.message_id:
                 o["status"] = "canceled"
+                o["total"] = 0
+                buyer_id = uid  # Точный ID покупателя
     save_orders(orders_db)
 
     await call.message.edit_text("\n".join(lines), reply_markup=None, parse_mode="HTML")
     await call.answer("✅ Весь заказ отменен, остатки возвращены!")
 
-async def handle_options(request):
-    return web.Response(headers={
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type"
-    })
+    # Оповещение покупателю
+    if buyer_id and buyer_id != str(ADMIN_CHAT_ID):
+        try:
+            await bot.send_message(
+                chat_id=int(buyer_id),
+                text="❌ <b>Ваш заказ был отменен администратором.</b>\nТовары возвращены на склад.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+# Глобальный CORS Middleware
+@web.middleware
+async def cors_middleware(request, handler):
+    if request.method == "OPTIONS":
+        return web.Response(headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS, DELETE, PUT",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With"
+        })
+    response = await handler(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS, DELETE, PUT"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+    return response
 
 async def handle_ping(request):
     return web.Response(text="Bot is running!")
 
 async def start_web_server():
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/", handle_ping)
     app.router.add_get("/orders", handle_get_orders)
     app.router.add_post("/order", handle_order_post)
     app.router.add_post("/order/edit", handle_order_edit)
-    app.router.add_options("/order", handle_options)
-    app.router.add_options("/order/edit", handle_options)
+    app.router.add_post("/order/delete", handle_order_delete)  # Роут удаления заказа
+
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    print(f"🚀 Веб-сервер запущен на порту {port}")
 
 async def main():
     await start_web_server()
     while True:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
-            print("Бот шопа ЖИЖКА запущен и слушает Telegram...")
+            print("🤖 Бот шопа ЖИЖКА запущен и слушает Telegram...")
             await dp.start_polling(bot, handle_signals=False)
         except Exception as e:
             print(f"⚠ Сбой соединения с Telegram: {e}. Рестарт через 5 сек...")
