@@ -11,7 +11,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import WebAppInfo, InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 
-BOT_TOKEN = "8737856125:AAEciw2iUH7OTEEV1lh6sfAK1kDvBwilWO0"
+BOT_TOKEN = "8896574305:AAFwFgiKWKh004XR76VL98YBNQtm_yFkGJg"
 ADMIN_CHAT_ID = 8651846848
 WEBAPP_URL = "https://regal-parfait-e29c47.netlify.app"
 GAS_URL = "https://script.google.com/macros/s/AKfycbyDk-sDPisni6TJ4R14SEzh5W765oSpj0-3PuqE0PeLGkbMkSW3XahP82Q64XuFHKgGTQ/exec"
@@ -62,7 +62,7 @@ def build_admin_keyboard_from_lines(lines):
 async def start_cmd(message: types.Message):
     user_id = message.from_user.id
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡ Открыть витрину ЖИЖКА", web_app=WebAppInfo(url=WEBAPP_URL))]
+        [InlineKeyboardButton(text="⚡ Открыть витрину", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
 
     if user_id == ADMIN_CHAT_ID:
@@ -75,8 +75,8 @@ async def start_cmd(message: types.Message):
         )
     else:
         await message.answer(
-            f"👋 <b>Добро пожаловать в шоп ЖИЖКА!</b>\n\n"
-            f"Жми кнопку ниже, чтобы собрать заказ:",
+            f"👋 <b>Добро пожаловать!</b>\n\n"
+            f"Жми кнопку ниже, чтобы бы продолжить:",
             reply_markup=kb,
             parse_mode="HTML"
         )
@@ -85,9 +85,9 @@ async def start_cmd(message: types.Message):
 @dp.message()
 async def any_text_handler(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡ Открыть витрину ЖИЖКА", web_app=WebAppInfo(url=WEBAPP_URL))]
+        [InlineKeyboardButton(text="⚡ Открыть витрину", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
-    await message.answer("Жми кнопку ниже, чтобы перейти в витрину шопа ЖИЖКА 👇", reply_markup=kb)
+    await message.answer("Жми кнопку ниже, чтобы перейти на сайт 👇", reply_markup=kb)
 
 # --- AIOHTTP WEB-ОБРАБОТЧИКИ (СИНХРОНИЗАЦИЯ С САЙТОМ) ---
 
@@ -177,12 +177,12 @@ async def handle_order_post(request):
             delivery_text = "🏬 <b>Способ:</b> Самовывоз"
 
         admin_msg = (
-            f"🚨 <b>НОВЫЙ ЗАКАЗ В ШОПЕ «ЖИЖКА»!</b>\n\n"
+            f"🚨 <b>НОВЫЙ ЗАКАЗ</b>\n\n"
             f"👤 <b>Покупатель:</b> {client_name} ({html.escape(username_str)})\n"
             f"🆔 ID: <code>{client_id}</code>\n\n"
             f"{delivery_text}\n\n"
-            f"📦 <b>Состав заказа:</b>\n{items_text}\n\n"
-            f"💵 <b>Итого за товары:</b> {total} ₽"
+            f"📦 <b>Состав:</b>\n{items_text}\n\n"
+            f"💵 <b>Итого:</b> {total} ₽"
         )
 
         admin_markup = build_admin_keyboard_from_lines(admin_msg.split("\n"))
@@ -217,7 +217,7 @@ async def handle_order_post(request):
                     f"✅ <b>Ваш заказ успешно оформлен!</b>\n\n"
                     f"{buyer_delivery}\n"
                     f"📦 <b>Товары:</b>\n{items_text}\n\n"
-                    f"💵 <b>Сумма:</b> {total} ₽\n\n"
+                    f"💵 <b>Сумма к оплате:</b> {total} ₽\n\n"
                     f"Администратор уже получил заявку и свяжется с вами."
                 )
                 await bot.send_message(chat_id=client_id, text=buyer_msg, parse_mode="HTML")
@@ -359,7 +359,7 @@ async def handle_order_done(call: types.CallbackQuery):
         try:
             await bot.send_message(
                 chat_id=int(buyer_id),
-                text="🎉 <b>Ваш заказ успешно выдан!</b>\nСпасибо за покупку в шопе ЖИЖКА! Ждем вас снова.",
+                text="🎉 <b>Ваш заказ успешно выдан!</b>\nСпасибо за покупку. Ждем вас снова.",
                 parse_mode="HTML"
             )
         except Exception:
@@ -518,7 +518,7 @@ async def main():
     while True:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
-            print("🤖 Бот шопа ЖИЖКА запущен и слушает Telegram...")
+            print("🤖 Бот запущен и слушает Telegram...")
             await dp.start_polling(bot, handle_signals=False)
         except Exception as e:
             print(f"⚠ Сбой соединения с Telegram: {e}. Рестарт через 5 сек...")
