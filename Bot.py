@@ -11,7 +11,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import WebAppInfo, InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 
-BOT_TOKEN = "8896574305:AAFwFgiKWKh004XR76VL98YBNQtm_yFkGJg"
+BOT_TOKEN = "8931585779:AAGCSFh--qMQSoofXTnM9alIDcDM2OTfA6w"
 ADMIN_CHAT_ID = 8651846848
 WEBAPP_URL = "https://regal-parfait-e29c47.netlify.app"
 GAS_URL = "https://script.google.com/macros/s/AKfycbyDk-sDPisni6TJ4R14SEzh5W765oSpj0-3PuqE0PeLGkbMkSW3XahP82Q64XuFHKgGTQ/exec"
