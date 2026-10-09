@@ -40,6 +40,20 @@ def save_orders(data):
 
 orders_db = load_orders()
 
+# Вспомогательный поиск заказа по ID или admin_message_id
+def find_order_in_db(order_id, client_id=None):
+    str_oid = str(order_id)
+    if client_id and str(client_id) in orders_db:
+        for o in orders_db[str(client_id)]:
+            if str(o.get("id")) == str_oid or str(o.get("admin_message_id")) == str_oid:
+                return str(client_id), o
+    for uid, user_orders in orders_db.items():
+        for o in user_orders:
+            if str(o.get("id")) == str_oid or str(o.get("admin_message_id")) == str_oid:
+                return uid, o
+    return None, None
+
+# Резервная клавиатура для Telegram (если понадобится)
 def build_admin_keyboard_from_lines(lines):
     bullet_indices = [i for i, l in enumerate(lines) if l.strip().startswith("•")]
     if not bullet_indices:
@@ -61,22 +75,26 @@ def build_admin_keyboard_from_lines(lines):
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
     user_id = message.from_user.id
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡ Открыть витрину", web_app=WebAppInfo(url=WEBAPP_URL))]
-    ])
-
     if user_id == ADMIN_CHAT_ID:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Открыть витрину (Каталог)", web_app=WebAppInfo(url=WEBAPP_URL))],
+            [InlineKeyboardButton(text="👑 Панель управления заказами", web_app=WebAppInfo(url=WEBAPP_URL))]
+        ])
         await message.answer(
             f"👑 <b>АВТОРИЗОВАН КАК ГЛАВНЫЙ АДМИНИСТРАТОР!</b>\n\n"
             f"🆔 Твой ID: <code>{user_id}</code>\n"
-            f"Все заказы, доставка, подтверждения и возвраты подключены сюда.",
+            f"Все заказы, склад и панель управления активны.\n"
+            f"Для работы с заказами нажми кнопку ниже 👇",
             reply_markup=kb,
             parse_mode="HTML"
         )
     else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Открыть витрину", web_app=WebAppInfo(url=WEBAPP_URL))]
+        ])
         await message.answer(
             f"👋 <b>Добро пожаловать!</b>\n\n"
-            f"Жми кнопку ниже, чтобы бы продолжить:",
+            f"Жми кнопку ниже, чтобы открыть каталог товаров и оформить заказ:",
             reply_markup=kb,
             parse_mode="HTML"
         )
@@ -87,11 +105,11 @@ async def any_text_handler(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚡ Открыть витрину", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
-    await message.answer("Жми кнопку ниже, чтобы перейти на сайт 👇", reply_markup=kb)
+    await message.answer("Жми кнопку ниже, чтобы перейти в витрину магазина 👇", reply_markup=kb)
 
 # --- AIOHTTP WEB-ОБРАБОТЧИКИ (СИНХРОНИЗАЦИЯ С САЙТОМ) ---
 
-# Отдача заказов сайту
+# 1. Отдача активных заказов покупателю
 async def handle_get_orders(request):
     user_id = request.query.get("user_id", "")
     user_orders = orders_db.get(str(user_id), [])
@@ -100,7 +118,7 @@ async def handle_get_orders(request):
         content_type="application/json"
     )
 
-# Удаление заказа клиентом через витрину
+# 2. Удаление заказа покупателем из истории
 async def handle_order_delete(request):
     try:
         data = await request.json()
@@ -121,7 +139,7 @@ async def handle_order_delete(request):
     except Exception as e:
         return web.Response(status=500, text=json.dumps({"status": "error", "message": str(e)}), content_type="application/json")
 
-# Прием нового заказа с сайта
+# 3. Прием нового заказа с витрины
 async def handle_order_post(request):
     try:
         data = await request.json()
@@ -136,7 +154,7 @@ async def handle_order_post(request):
         username_str = f"@{raw_username}" if raw_username else "Не указан"
         client_name = html.escape(user_info.get("name") or "Покупатель")
 
-        # Группировка одинаковых товаров с защитой от undefined
+        # Группировка товаров
         counts = Counter()
         for it in items:
             t = it.get("title", "Товар")
@@ -146,16 +164,14 @@ async def handle_order_post(request):
             counts[(t, v, p, tl)] += 1
 
         items_for_gas = []
-        order_lines = []
         clean_items_list = []
 
         for (t, v, p, tl), count in counts.items():
-            items_for_gas.append({"variant": v, "qty": count})
-            order_lines.append(f"• <b>{html.escape(t)}</b> [{tl}: {html.escape(v)}] — {count} шт. по {p} ₽")
+            items_for_gas.append({"title": t, "variant": v, "qty": count})
             for _ in range(count):
                 clean_items_list.append({"title": t, "variant": v, "price": p, "typeLabel": tl})
 
-        # Списание остатков в Google Таблице
+        # Списание остатков в Google Таблице (Two-Phase Commit)
         async with aiohttp.ClientSession() as session:
             async with session.post(GAS_URL, json={"action": "deduct", "items": items_for_gas}, allow_redirects=True) as resp:
                 resp_text = await resp.text()
@@ -170,64 +186,79 @@ async def handle_order_post(request):
                 except Exception:
                     pass
 
-        items_text = "\n".join(order_lines)
+        order_id = int(datetime.datetime.now().timestamp() * 1000)
+        order_short_id = str(order_id)[-4:]
+
         if delivery_type == "delivery":
             delivery_text = f"🚗 <b>Способ:</b> Доставка (150–400 ₽)\n📍 <b>Адрес:</b> {delivery_addr or 'Уточнить при связи'}"
+            buyer_delivery = f"🚗 <b>Доставка:</b> 150–400 ₽ (адрес: {delivery_addr or 'Уточнить при связи'})"
         else:
             delivery_text = "🏬 <b>Способ:</b> Самовывоз"
+            buyer_delivery = "🏬 <b>Способ получения:</b> Самовывоз"
 
+        # БЕЗОПАСНОЕ УВЕДОМЛЕНИЕ АДМИНИСТРАТОРУ (без названий запрещенных товаров в открытом чате)
         admin_msg = (
-            f"🚨 <b>НОВЫЙ ЗАКАЗ</b>\n\n"
+            f"🔔 <b>НОВЫЙ ЗАКАЗ #{order_short_id}!</b>\n\n"
             f"👤 <b>Покупатель:</b> {client_name} ({html.escape(username_str)})\n"
             f"🆔 ID: <code>{client_id}</code>\n\n"
             f"{delivery_text}\n\n"
-            f"📦 <b>Состав:</b>\n{items_text}\n\n"
-            f"💵 <b>Итого:</b> {total} ₽"
+            f"💵 <b>Сумма к оплате:</b> {total} ₽\n"
+            f"📦 <b>Позиций в заказе:</b> {len(clean_items_list)} шт.\n\n"
+            f"👑 <i>Полный состав заказа и кнопки управления (возврат, выдача, отмена) доступны во вкладке «Админка» внутри витрины.</i>"
         )
 
-        admin_markup = build_admin_keyboard_from_lines(admin_msg.split("\n"))
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👑 Открыть панель управления", web_app=WebAppInfo(url=WEBAPP_URL))]
+        ])
+
         sent_admin_msg = await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
             text=admin_msg,
-            reply_markup=admin_markup,
+            reply_markup=admin_kb,
             parse_mode="HTML"
         )
 
         order_entry = {
-            "id": int(datetime.datetime.now().timestamp() * 1000),
+            "id": order_id,
             "admin_message_id": sent_admin_msg.message_id,
             "date": datetime.datetime.now().strftime("%H:%M"),
+            "created_at": datetime.datetime.now().strftime("%d.%m %H:%M"),
+            "user": {
+                "id": client_id,
+                "name": client_name,
+                "username": raw_username or ""
+            },
             "items": clean_items_list,
             "total": total,
             "delivery_type": delivery_type,
             "delivery_address": delivery_addr,
             "status": "active"
         }
+
         str_cid = str(client_id)
         if str_cid not in orders_db:
             orders_db[str_cid] = []
         orders_db[str_cid].insert(0, order_entry)
         save_orders(orders_db)
 
-        # Чек клиенту в Telegram
+        # БЕЗОПАСНЫЙ СТЕЛС-ЧЕК ПОКУПАТЕЛЮ В TELEGRAM
         if client_id and client_id != ADMIN_CHAT_ID:
             try:
-                buyer_delivery = "🚗 Доставка: 150–400 ₽ (администратор согласует точную сумму)" if delivery_type == "delivery" else "🏬 Самовывоз"
                 buyer_msg = (
-                    f"✅ <b>Ваш заказ успешно оформлен!</b>\n\n"
+                    f"✅ <b>Ваш заказ #{order_short_id} успешно оформлен!</b>\n\n"
                     f"{buyer_delivery}\n"
-                    f"📦 <b>Товары:</b>\n{items_text}\n\n"
-                    f"💵 <b>Сумма к оплате:</b> {total} ₽\n\n"
+                    f"💵 <b>Сумма:</b> {total} ₽\n\n"
+                    f"📦 <i>Полный состав и актуальный статус заказа доступны внутри витрины во вкладке «Активные заказы».</i>\n\n"
                     f"Администратор уже получил заявку и свяжется с вами."
                 )
                 await bot.send_message(chat_id=client_id, text=buyer_msg, parse_mode="HTML")
             except Exception:
                 pass
 
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Новый заказ от {client_name} на сумму {total} ₽")
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Новый заказ #{order_short_id} от {client_name} на {total} ₽")
 
         return web.Response(
-            text=json.dumps({"status": "ok", "admin_message_id": sent_admin_msg.message_id}),
+            text=json.dumps({"status": "ok", "admin_message_id": sent_admin_msg.message_id, "order_id": order_id}),
             content_type="application/json"
         )
     except Exception as e:
@@ -238,7 +269,7 @@ async def handle_order_post(request):
             content_type="application/json"
         )
 
-# Изменение заказа покупателем
+# 4. Редактирование заказа покупателем с витрины
 async def handle_order_edit(request):
     try:
         data = await request.json()
@@ -282,40 +313,10 @@ async def handle_order_edit(request):
             tl = it.get("typeLabel") or "Вкус"
             counts[(t, v, p, tl)] += 1
 
-        order_lines = []
         clean_new_items = []
         for (t, v, p, tl), count in counts.items():
-            order_lines.append(f"• <b>{html.escape(t)}</b> [{tl}: {html.escape(v)}] — {count} шт. по {p} ₽")
             for _ in range(count):
                 clean_new_items.append({"title": t, "variant": v, "price": p, "typeLabel": tl})
-
-        items_text = "\n".join(order_lines)
-        if delivery_type == "delivery":
-            delivery_text = f"🚗 <b>Способ:</b> Доставка (150–400 ₽)\n📍 <b>Адрес:</b> {delivery_addr or 'Уточнить при связи'}"
-        else:
-            delivery_text = "🏬 <b>Способ:</b> Самовывоз"
-
-        updated_msg = (
-            f"🔄 <b>ЗАКАЗ ИЗМЕНЕН ПОКУПАТЕЛЕМ!</b>\n\n"
-            f"👤 <b>Покупатель:</b> {client_name} ({html.escape(username_str)})\n"
-            f"🆔 ID: <code>{client_id}</code>\n\n"
-            f"{delivery_text}\n\n"
-            f"📦 <b>Актуальный состав заказа:</b>\n{items_text}\n\n"
-            f"💵 <b>Новый итог:</b> {total} ₽"
-        )
-
-        admin_markup = build_admin_keyboard_from_lines(updated_msg.split("\n"))
-        if admin_message_id:
-            try:
-                await bot.edit_message_text(
-                    chat_id=ADMIN_CHAT_ID,
-                    message_id=admin_message_id,
-                    text=updated_msg,
-                    reply_markup=admin_markup,
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                print(f"⚠ Ошибка обновления сообщения админа: {e}")
 
         # Обновление в базе
         str_cid = str(client_id)
@@ -328,159 +329,197 @@ async def handle_order_edit(request):
                     o["delivery_address"] = delivery_addr
             save_orders(orders_db)
 
+        # Безопасное уведомление админу об изменении
+        if admin_message_id:
+            try:
+                updated_admin_text = (
+                    f"🔄 <b>ЗАКАЗ ОБНОВЛЕН ПОКУПАТЕЛЕМ!</b>\n\n"
+                    f"👤 <b>Покупатель:</b> {client_name} ({html.escape(username_str)})\n"
+                    f"🆔 ID: <code>{client_id}</code>\n\n"
+                    f"💵 <b>Новая сумма:</b> {total} ₽\n"
+                    f"📦 <b>Позиций:</b> {len(clean_new_items)} шт.\n\n"
+                    f"👑 <i>Откройте панель администратора для проверки.</i>"
+                )
+                admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="👑 Открыть панель управления", web_app=WebAppInfo(url=WEBAPP_URL))]
+                ])
+                await bot.edit_message_text(
+                    chat_id=ADMIN_CHAT_ID,
+                    message_id=admin_message_id,
+                    text=updated_admin_text,
+                    reply_markup=admin_kb,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                print(f"⚠ Ошибка обновления сообщения админа: {e}")
+
         return web.Response(text=json.dumps({"status": "ok"}), content_type="application/json")
     except Exception as e:
         print(f"❌ Ошибка в handle_order_edit: {e}")
         return web.Response(status=500, text=json.dumps({"status": "error", "message": str(e)}), content_type="application/json")
 
-# --- КНОПКИ АДМИНИСТРАТОРА В TELEGRAM ---
 
-# Подтверждение выполнения заказа
-@dp.callback_query(F.data == "order_done")
-async def handle_order_done(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_CHAT_ID:
-        return await call.answer("❌ Только администратор!", show_alert=True)
-    
-    buyer_id = None
+# --- ЭНДПОИНТЫ ПАНЕЛИ УПРАВЛЕНИЯ (АДМИНКА ВНУТРИ WEBAPP) ---
+
+# 5. Получение всех заказов для админки
+async def handle_admin_get_orders(request):
+    admin_id = request.query.get("admin_id") or request.query.get("user_id")
+    if str(admin_id) != str(ADMIN_CHAT_ID):
+        return web.Response(status=403, text=json.dumps({"status": "error", "message": "Доступ запрещен"}), content_type="application/json")
+
+    all_orders = []
     for uid, user_orders in orders_db.items():
-        for o in user_orders:
-            if o.get("admin_message_id") == call.message.message_id:
-                o["status"] = "completed"
-                buyer_id = uid
-    save_orders(orders_db)
+        for order in user_orders:
+            o_copy = dict(order)
+            if "user" not in o_copy or not o_copy["user"]:
+                o_copy["user"] = {"id": uid, "name": "Покупатель", "username": ""}
+            all_orders.append(o_copy)
 
-    orig_html = call.message.html_text or call.message.text
-    new_text = orig_html + "\n\n🎉 <b>ЗАКАЗ УСПЕШНО ВЫПОЛНЕН И ВЫДАН!</b>"
-    await call.message.edit_text(new_text, reply_markup=None, parse_mode="HTML")
-    await call.answer("✅ Заказ подтвержден и закрыт!")
+    # Сортировка: новые заказы сверху
+    all_orders.sort(key=lambda x: x.get("id", 0), reverse=True)
+    return web.Response(text=json.dumps(all_orders), content_type="application/json")
 
-    # Оповещение покупателю
-    if buyer_id and buyer_id != str(ADMIN_CHAT_ID):
-        try:
-            await bot.send_message(
-                chat_id=int(buyer_id),
-                text="🎉 <b>Ваш заказ успешно выдан!</b>\nСпасибо за покупку. Ждем вас снова.",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
+# 6. Поштучный возврат позиции из админки WebApp
+async def handle_admin_return_one(request):
+    try:
+        data = await request.json()
+        admin_id = str(data.get("admin_id", ""))
+        if admin_id != str(ADMIN_CHAT_ID):
+            return web.Response(status=403, text=json.dumps({"status": "error", "message": "Доступ запрещен"}), content_type="application/json")
 
-# Поштучный возврат позиции на склад
-@dp.callback_query(F.data.startswith("ret1_"))
-async def handle_return_one(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_CHAT_ID:
-        return await call.answer("❌ Только администратор!", show_alert=True)
+        order_id = data.get("order_id")
+        client_id = data.get("client_id")
+        variant = str(data.get("variant", "")).strip()
+        title = str(data.get("title", "")).strip()
+        price = int(data.get("price") or 0)
 
-    target_btn_idx = int(call.data.split("_")[1])
-    raw_text = call.message.html_text or call.message.text
-    lines = raw_text.split("\n")
-    bullet_indices = [i for i, l in enumerate(lines) if l.strip().startswith("•")]
+        if not variant:
+            return web.Response(status=400, text=json.dumps({"status": "error", "message": "Не указан вариант для возврата"}), content_type="application/json")
 
-    if target_btn_idx >= len(bullet_indices):
-        return await call.answer("Позиция уже возвращена!", show_alert=True)
+        # 1. Возврат в Google Таблицу (action: add)
+        gas_item = {"variant": variant, "qty": 1}
+        if title:
+            gas_item["title"] = title
 
-    line_idx = bullet_indices[target_btn_idx]
-    line_text = lines[line_idx]
-
-    pattern = r"•\s*(?:<b>)?(.*?)(?:</b>)?\s*\[(Вкус|Цвет):\s*(.*?)\]\s*—\s*(\d+)\s*шт\.\s*по\s*(\d+)"
-    m = re.search(pattern, line_text)
-    if not m:
-        return await call.answer("Ошибка парсинга строки", show_alert=True)
-
-    title = html.unescape(m.group(1).strip())
-    tlabel = m.group(2).strip()
-    variant = html.unescape(m.group(3).strip())
-    qty = int(m.group(4))
-    price = int(m.group(5))
-
-    # Возврат 1 шт в Google Таблицу
-    async with aiohttp.ClientSession() as session:
-        await session.post(GAS_URL, json={"action": "add", "items": [{"variant": variant, "qty": 1}]}, allow_redirects=True)
-
-    new_qty = qty - 1
-    if new_qty > 0:
-        lines[line_idx] = f"• <b>{html.escape(title)}</b> [{tlabel}: {html.escape(variant)}] — {new_qty} шт. по {price} ₽"
-    else:
-        lines[line_idx] = f"❌ <s><b>{html.escape(title)}</b> [{tlabel}: {html.escape(variant)}] — 1 шт.</s> (Возвращено)"
-
-    # Пересчет суммы с сохранением тегов
-    total_pattern = r"((?:<b>)?(?:Итого к оплате|Итого за товары|Новый итог к оплате|Новый итог|Итого):?(?:</b>)?:?\s*)(\d+)"
-    total_match = re.search(total_pattern, raw_text)
-    if total_match:
-        old_total = int(total_match.group(2))
-        new_total = max(0, old_total - price)
-        lines = [re.sub(total_pattern, rf"\g<1>{new_total}", l) for l in lines]
-
-    # Корректировка в базе
-    for user_orders in orders_db.values():
-        for o in user_orders:
-            if o.get("admin_message_id") == call.message.message_id:
-                o["total"] = max(0, o.get("total", 0) - price)
-                for item in o.get("items", []):
-                    item_var = item.get("variant") or item.get("cleanName")
-                    if item_var == variant:
-                        o["items"].remove(item)
-                        break
-                if not o.get("items") or o["total"] == 0:
-                    o["status"] = "canceled"
-    save_orders(orders_db)
-
-    new_kb = build_admin_keyboard_from_lines(lines)
-    await call.message.edit_text("\n".join(lines), reply_markup=new_kb, parse_mode="HTML")
-    await call.answer(f"✅ 1 шт. ({variant}) возвращена на склад!")
-
-# Полная отмена заказа
-@dp.callback_query(F.data == "ret_all")
-async def handle_return_all(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_CHAT_ID:
-        return await call.answer("❌ Только администратор!", show_alert=True)
-
-    raw_text = call.message.html_text or call.message.text
-    lines = raw_text.split("\n")
-    items_to_return = []
-
-    pattern = r"•\s*(?:<b>)?(.*?)(?:</b>)?\s*\[(?:Вкус|Цвет):\s*(.*?)\]\s*—\s*(\d+)\s*шт"
-    for idx, line in enumerate(lines):
-        if line.strip().startswith("•"):
-            m = re.search(pattern, line)
-            if m:
-                var_name = html.unescape(m.group(2).strip())
-                items_to_return.append({"variant": var_name, "qty": int(m.group(3))})
-                lines[idx] = re.sub(r"^•\s*", "❌ <s>", line) + "</s> (Отменено)"
-
-    # Возврат всех позиций в Google Таблицу
-    if items_to_return:
         async with aiohttp.ClientSession() as session:
-            await session.post(GAS_URL, json={"action": "add", "items": items_to_return}, allow_redirects=True)
+            await session.post(GAS_URL, json={"action": "add", "items": [gas_item]}, allow_redirects=True)
 
-    total_pattern = r"((?:<b>)?(?:Итого к оплате|Итого за товары|Новый итог к оплате|Новый итог|Итого):?(?:</b>)?:?\s*)\d+"
-    lines = [re.sub(total_pattern, r"\g<1>0", l) for l in lines]
-    lines.append("\n❌ <b>ЗАКАЗ ПОЛНОСТЬЮ АННУЛИРОВАН</b>")
+        # 2. Обновление заказа в базе
+        uid, order = find_order_in_db(order_id, client_id)
+        if not order:
+            return web.Response(status=404, text=json.dumps({"status": "error", "message": "Заказ не найден"}), content_type="application/json")
 
-    buyer_id = None
-    for uid, user_orders in orders_db.items():
-        for o in user_orders:
-            if o.get("admin_message_id") == call.message.message_id:
-                o["status"] = "canceled"
-                o["total"] = 0
-                buyer_id = uid  # Точный ID покупателя
-    save_orders(orders_db)
+        # Удаляем ровно 1 экземпляр товара
+        found_item = False
+        for it in order.get("items", []):
+            it_var = str(it.get("variant") or it.get("cleanName") or "").strip()
+            if it_var.lower() == variant.lower():
+                order["items"].remove(it)
+                found_item = True
+                break
 
-    await call.message.edit_text("\n".join(lines), reply_markup=None, parse_mode="HTML")
-    await call.answer("✅ Весь заказ отменен, остатки возвращены!")
+        order["total"] = max(0, int(order.get("total", 0)) - price)
+        if len(order.get("items", [])) == 0 or order["total"] == 0:
+            order["status"] = "canceled"
 
-    # Оповещение покупателю
-    if buyer_id and buyer_id != str(ADMIN_CHAT_ID):
-        try:
-            await bot.send_message(
-                chat_id=int(buyer_id),
-                text="❌ <b>Ваш заказ был отменен администратором.</b>\nТовары возвращены на склад.",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
+        save_orders(orders_db)
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Админ вернул 1 шт. ({variant}) по заказу #{order_id}")
 
-# Глобальный CORS Middleware
+        return web.Response(text=json.dumps({"status": "ok", "order": order}), content_type="application/json")
+    except Exception as e:
+        print(f"❌ Ошибка в handle_admin_return_one: {e}")
+        return web.Response(status=500, text=json.dumps({"status": "error", "message": str(e)}), content_type="application/json")
+
+# 7. Полная отмена заказа из админки WebApp
+async def handle_admin_return_all(request):
+    try:
+        data = await request.json()
+        admin_id = str(data.get("admin_id", ""))
+        if admin_id != str(ADMIN_CHAT_ID):
+            return web.Response(status=403, text=json.dumps({"status": "error", "message": "Доступ запрещен"}), content_type="application/json")
+
+        order_id = data.get("order_id")
+        client_id = data.get("client_id")
+
+        uid, order = find_order_in_db(order_id, client_id)
+        if not order:
+            return web.Response(status=404, text=json.dumps({"status": "error", "message": "Заказ не найден"}), content_type="application/json")
+
+        # Собираем все позиции для возврата в Таблицу
+        items_counts = Counter()
+        for it in order.get("items", []):
+            t = it.get("title", "")
+            v = it.get("variant") or it.get("cleanName") or ""
+            if v:
+                items_counts[(t, v)] += 1
+
+        items_to_gas = [{"title": t, "variant": v, "qty": q} for (t, v), q in items_counts.items()]
+
+        if items_to_gas:
+            async with aiohttp.ClientSession() as session:
+                await session.post(GAS_URL, json={"action": "add", "items": items_to_gas}, allow_redirects=True)
+
+        order["status"] = "canceled"
+        order["total"] = 0
+        save_orders(orders_db)
+
+        # Оповещение покупателю
+        buyer_uid = uid or client_id
+        if buyer_uid and str(buyer_uid) != str(ADMIN_CHAT_ID):
+            try:
+                await bot.send_message(
+                    chat_id=int(buyer_uid),
+                    text="❌ <b>Ваш заказ был отменен администратором.</b>\nЕсли у вас есть вопросы, свяжитесь с поддержкой.",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Админ полностью аннулировал заказ #{order_id}")
+        return web.Response(text=json.dumps({"status": "ok", "order": order}), content_type="application/json")
+    except Exception as e:
+        print(f"❌ Ошибка в handle_admin_return_all: {e}")
+        return web.Response(status=500, text=json.dumps({"status": "error", "message": str(e)}), content_type="application/json")
+
+# 8. Завершение заказа (выдача) из админки WebApp
+async def handle_admin_complete(request):
+    try:
+        data = await request.json()
+        admin_id = str(data.get("admin_id", ""))
+        if admin_id != str(ADMIN_CHAT_ID):
+            return web.Response(status=403, text=json.dumps({"status": "error", "message": "Доступ запрещен"}), content_type="application/json")
+
+        order_id = data.get("order_id")
+        client_id = data.get("client_id")
+
+        uid, order = find_order_in_db(order_id, client_id)
+        if not order:
+            return web.Response(status=404, text=json.dumps({"status": "error", "message": "Заказ не найден"}), content_type="application/json")
+
+        order["status"] = "completed"
+        save_orders(orders_db)
+
+        # Оповещение покупателю
+        buyer_uid = uid or client_id
+        if buyer_uid and str(buyer_uid) != str(ADMIN_CHAT_ID):
+            try:
+                await bot.send_message(
+                    chat_id=int(buyer_uid),
+                    text="🎉 <b>Ваш заказ успешно выдан!</b>\nСпасибо за покупку. Ждем вас снова!",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Админ завершил заказ #{order_id}")
+        return web.Response(text=json.dumps({"status": "ok", "order": order}), content_type="application/json")
+    except Exception as e:
+        print(f"❌ Ошибка в handle_admin_complete: {e}")
+        return web.Response(status=500, text=json.dumps({"status": "error", "message": str(e)}), content_type="application/json")
+
+
+# --- ГЛОБАЛЬНЫЙ CORS MIDDLEWARE И ЗАПУСК СЕРВЕРА ---
+
 @web.middleware
 async def cors_middleware(request, handler):
     if request.method == "OPTIONS":
@@ -500,25 +539,33 @@ async def handle_ping(request):
 
 async def start_web_server():
     app = web.Application(middlewares=[cors_middleware])
+    
+    # Публичные роуты для витрины
     app.router.add_get("/", handle_ping)
     app.router.add_get("/orders", handle_get_orders)
     app.router.add_post("/order", handle_order_post)
     app.router.add_post("/order/edit", handle_order_edit)
-    app.router.add_post("/order/delete", handle_order_delete)  # Роут удаления заказа
+    app.router.add_post("/order/delete", handle_order_delete)
+
+    # Защищенные роуты для панели администратора (WebApp)
+    app.router.add_get("/admin/orders", handle_admin_get_orders)
+    app.router.add_post("/admin/order/return-one", handle_admin_return_one)
+    app.router.add_post("/admin/order/return-all", handle_admin_return_all)
+    app.router.add_post("/admin/order/complete", handle_admin_complete)
 
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"🚀 Веб-сервер запущен на порту {port}")
+    print(f"🚀 Веб-сервер запущен на порту {port} (включая защищенные роуты админки)")
 
 async def main():
     await start_web_server()
     while True:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
-            print("🤖 Бот запущен и слушает Telegram...")
+            print("🤖 Бот запущен в безопасном стелс-режиме и слушает Telegram...")
             await dp.start_polling(bot, handle_signals=False)
         except Exception as e:
             print(f"⚠ Сбой соединения с Telegram: {e}. Рестарт через 5 сек...")
