@@ -14,7 +14,7 @@ from aiohttp import web
 BOT_TOKEN = "8931585779:AAGCSFh--qMQSoofXTnM9alIDcDM2OTfA6w"
 ADMIN_CHAT_ID = 8651846848
 SUPPORT_USERNAME = "Korka_999"
-WEBAPP_URL = "https://regal-parfait-e29c47.netlify.app"
+WEBAPP_URL = "https://korka-portal.netlify.app"
 GAS_URL = "https://script.google.com/macros/s/AKfycbyDk-sDPisni6TJ4R14SEzh5W765oSpj0-3PuqE0PeLGkbMkSW3XahP82Q64XuFHKgGTQ/exec"
 
 bot = Bot(token=BOT_TOKEN)
